@@ -1,11 +1,11 @@
 import { Aftermath, Router } from "aftermath-ts-sdk";
 import { ethers } from "ethers";
-const { Ed25519Keypair } = require("@mysten/sui/keypairs/ed25519");
+import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { getFullnodeUrl, SuiClient } from "@mysten/sui/client";
 import { Transaction } from "@mysten/sui/transactions";
 import { bech32 } from "bech32";
 
-const { BCS, getSuiMoveConfig } = require("@mysten/bcs");
+import { BCS, getSuiMoveConfig } from "@mysten/bcs";
 const bcs = new BCS(getSuiMoveConfig());
 
 export function bech32PrivateKeyToHex(pk: string): string | undefined {
@@ -22,7 +22,7 @@ export function bech32PrivateKeyToHex(pk: string): string | undefined {
 export async function signAndSendTx(
   client: SuiClient,
   txb: Transaction | Uint8Array,
-  signer: typeof Ed25519Keypair
+  signer: Ed25519Keypair
 ) {
   return await client.signAndExecuteTransaction({
     transaction: txb,
@@ -41,7 +41,7 @@ export async function signAndSendTx(
 
 export async function swap_and_i_relay(
   router: Router,
-  signer: typeof Ed25519Keypair,
+  signer: Ed25519Keypair,
   client: SuiClient,
   coinInType: string,
   coinOutType: string,
@@ -193,7 +193,7 @@ async function main() {
         console.error("Failed to get private key hex");
         // Handle the error case here, maybe throw an error or return early
     }
-
+if (signer)
     await swap_and_i_relay(
         router,
         signer,
@@ -212,9 +212,5 @@ async function main() {
   );
 };
 
-if (require.main === module) {
-    main().catch(error => {
-        console.error("An error occurred:", error);
-        process.exit(1);
-    });
-}
+
+    main()
