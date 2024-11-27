@@ -63,7 +63,7 @@ export async function swap_and_i_relay(
   }
 ) {
 
-    const MAX_RETRIES = 5; // Maximum number of retries
+    const MAX_RETRIES = 10; // Maximum number of retries
     let retryCount = 0;
 
     const af_module_address = "0x" + assetForwarderAddress.slice(2, 66);
@@ -131,6 +131,13 @@ export async function swap_and_i_relay(
                 ],
                 typeArguments: [coinOutType],
             });
+            
+            const suiReward = 0.015 * 10 ** 9;
+
+            const splittedCoin = txb.splitCoins(txb.gas,[suiReward])
+
+            // Transfer the coin to the recipient
+            txb.transferObjects([splittedCoin], txb.pure.address(recipient));
             
             const result = await signAndSendTx(client, txb, signer);
         
