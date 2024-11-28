@@ -148,25 +148,21 @@ export async function swap_and_i_relay(
             return;
         } catch (error) {
             retryCount++;
-            console.error(
-                JSON.stringify({
-                    message: "Error occurred during fund relay",
-                    error: error,
-                    attempt: retryCount,
-                })
-            );
-        
             if (retryCount > MAX_RETRIES) {
                 // Log failure after all retries
-                console.error(
+                const formattedError = {
+                  error: error instanceof Error ? error.message : "Unknown error occurred",
+                };
+                // Log failure after all retries
+                console.log(
                     JSON.stringify({ 
                         message: "Fund relay failed after maximum retries", 
-                        error 
+                        error : formattedError.error
                     })
                 );
-                return;
-            }
-        }
+            process.exit(1);
+          }
+      }
     }
 }
 
