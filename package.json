@@ -10,13 +10,16 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@flowx-finance/sdk": "^1.9.7",
+    "@mysten/bcs": "0.11.1",
     "@mysten/sui": "^1.14.0",
     "aftermath-ts-sdk": "^1.2.1",
     "bech32": "^2.0.0",
     "ethers": "^6.13.4",
-    "@mysten/bcs": "0.11.1"
+    "turbos-clmm-sdk": "^3.1.2"
   },
   "resolutions": {
-    "@mysten/sui.js": "^0.54.1"
+    "@mysten/sui.js": "^0.54.1",
+    "@mysten/sui": "1.18.0"
   }
 }

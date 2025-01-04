@@ -6,6 +6,7 @@ import { getFullnodeUrl, SuiClient } from "@mysten/sui/client";
 import { Transaction } from "@mysten/sui/transactions";
 import axios from "axios";
 import { BCS, getSuiMoveConfig } from "@mysten/bcs";
+import { AggregatorQuoter, TradeBuilder } from "@flowx-finance/sdk";
 const bcs = new BCS(getSuiMoveConfig());
 
 
@@ -233,13 +234,24 @@ async function executeTurbosSwap(
         slippage: String(slippage),
         amountSpecifiedIsInput: true,
         a2b: a2b,
-        address: signer.toSuiAddress(),
+        address: signer.getPublicKey().toSuiAddress(),
       };
 
       const { txb, coinVecA, coinVecB } = await sdk.trade.swapWithReturn(swapOptions);
 
       // Use the coinOutId from the appropriate vector (coinVecA or coinVecB)
-      const coinOutId = a2b ? coinVecB : coinVecA;
+      let coinOutId 
+      if(a2b){
+        coinOutId = coinVecB
+        if(coinVecA){
+          txb.transferObjects([coinVecA],txb.pure.address(recipient))
+        }
+      } else {
+        coinOutId = coinVecA
+        if(coinVecB){
+          txb.transferObjects([coinVecB],txb.pure.address(recipient))
+        }
+      }
 
       if (!coinOutId) {
         throw new Error(
@@ -409,6 +421,143 @@ async function getBestPoolIdAndDirection(
   
 }
 
+/////////////////////////////////////////////////////////////////////////////
+//////////////////////////// FlowX Swap ///////////////////////////////////
+///////////////////////////////////////////////////////////////////////////
+async function executeFlowXSwap(  
+  signer: Ed25519Keypair,
+  client: SuiClient,
+  quoter: AggregatorQuoter,
+  coinInType: string,
+  coinOutType: string,
+  assetForwarderAddress : string,
+  {
+    amount,
+    recipient,
+    src_chain_id,
+    deposit_id,
+    forwarder_router_address,
+    minDestAmount,
+  }: {
+    amount: string | number | bigint;
+    recipient: string;
+    src_chain_id:string;
+    deposit_id:string;
+    forwarder_router_address:string;
+    minDestAmount:number;
+  }
+) {
+
+  const MAX_RETRIES = 5; // Maximum number of retries
+  let retryCount = 0;
+
+  const af_module_address = "0x" + assetForwarderAddress.slice(2, 66);
+  const af_object_id = "0x" + assetForwarderAddress.slice(66);
+
+  while (retryCount <= MAX_RETRIES) {
+    try {
+      const routes = await quoter.getRoutes({
+        tokenIn: coinInType,
+        tokenOut: coinOutType,
+        amountIn: amount as string,
+      })
+
+      const coinOutAmount = Number(routes.amountOut);
+
+      if (coinOutAmount <= 0) {
+        throw new Error(
+          JSON.stringify({
+            message: "Invalid coinOutAmount received from route",
+            coinOutAmount,
+          })
+        );
+      }
+
+      if (coinOutAmount < minDestAmount) {
+          throw new Error(
+            JSON.stringify({
+              message: "Insufficient coinOutAmount",
+              coinOutAmount,
+              minDestAmount,
+              retryCount,
+            })
+          );
+      }
+
+      const slippage = (((coinOutAmount - minDestAmount) / coinOutAmount) * 100) * 10000;
+
+      const tradeBuilder = new TradeBuilder("mainnet", routes.routes); 
+
+      const trade = tradeBuilder
+                      .sender(signer.getPublicKey().toSuiAddress())
+                      .amountIn(amount as string)
+                      .amountOut(routes.amountOut)
+                      .slippage(Number(slippage.toFixed(0))) //  1% = 10000
+                      .deadline(Date.now() +3600000) // 1 hour from now
+                      .build();
+      
+      const txb = new Transaction()
+
+      const coinOutId = await trade.swap({ tx: txb, client: client });
+
+      if (!af_object_id || !coinOutId) {
+        throw new Error(
+          JSON.stringify({
+              message: "Fund relay failed due to undefined arguments",
+              af_object_id,
+              coinOutId,
+          })
+        );
+      }
+
+      txb.moveCall({
+        target: `${af_module_address}::asset_forwarder::i_relay`,
+        arguments: [
+        txb.object(af_object_id),
+        txb.object(coinOutId),
+        txb.pure.u64(minDestAmount), 
+        txb.pure(bcs.ser("vector<u8>", ethers.getBytes(src_chain_id)).toBytes()),
+        txb.pure.u256(deposit_id),
+        txb.pure.address(recipient),
+        txb.pure.string(forwarder_router_address),
+        ],
+        typeArguments: [coinOutType],
+      });
+
+      const suiReward = 0.015 * 10 ** 9;
+
+      const splittedCoin = txb.splitCoins(txb.gas,[suiReward])
+
+      // Transfer the coin to the recipient
+      txb.transferObjects([splittedCoin], txb.pure.address(recipient));
+
+      const txResult = await signAndSendTx(client, txb, signer);
+
+      console.log(
+        JSON.stringify({ message: "Fund relayed successfully", digest: txResult.digest })
+      );
+
+      return;
+
+      } catch (error) {
+        retryCount++;
+        if (retryCount > MAX_RETRIES) {
+          // Log failure after all retries
+          const formattedError = {
+            error: error instanceof Error ? error.message : "Unknown error occurred",
+          };
+          // Log failure after all retries
+          console.log(
+              JSON.stringify({ 
+                  message: "Fund relay in FlowX failed after maximum retries", 
+                  error : formattedError.error
+              })
+          );
+          throw new Error(formattedError.error);
+      }
+    }
+  }
+}
 
 /////////////////////////////////////////////////////////////////////////////
 //////////////////////////// MAIN //////////////////////////////////////////
@@ -443,19 +592,14 @@ async function main() {
   const aftermathSdk = new Aftermath("MAINNET");
   const turbosSdk = new TurbosSdk(Network.mainnet);
   const turbosApiUrl = "https://api.turbos.finance/pools/v2?page=1&pageSize=1000&orderBy=liquidity";
+  const quoter = new AggregatorQuoter('mainnet');
 
   // DEX Registry
   const dexRegistry: Record<number, { name: string; execute: () => Promise<void>; getQuote: () => Promise<any> }> = {
     1: {
       name: "Aftermath",
       execute: async () =>
-        executeAftermathSwap(
-          aftermathSdk.Router(),
-          signer,
-          client,
-          _coinInType,
-          _coinOutType,
-          assetForwarderAddress,
+        executeAftermathSwap(aftermathSdk.Router(),signer,client,_coinInType,_coinOutType,assetForwarderAddress,
           {
             amount,
             recipient: _recipient,
@@ -485,6 +629,20 @@ async function main() {
         }),
       getQuote: async () =>
         getTurbosQuote(signer, turbosSdk, _coinInType, _coinOutType, turbosApiUrl, amount),
+    },
+    3 : {
+      name: "FlowX",
+      execute: async () =>
+        executeFlowXSwap(signer, client, quoter, _coinInType, _coinOutType, assetForwarderAddress, {
+          amount,
+          recipient: _recipient,
+          src_chain_id: _srcChainId,
+          deposit_id: depositId,
+          forwarder_router_address: forwarderRouterAddress,
+          minDestAmount: Number(minDestAmount),
+        }),
+      getQuote: async () => 
+        quoter.getRoutes({tokenIn: coinInType,tokenOut: coinOutType,amountIn: amount as string}),    
     }
   };
 
@@ -501,7 +659,7 @@ async function main() {
         const primaryErrorMessage = primaryError instanceof Error ? primaryError.message : `Unknown error: ${String(primaryError)}`;
         console.error(`Swap failed on ${selectedDex.name}:`, primaryErrorMessage);
 
-        // Handle fallback to other DEXes
+        //Handle fallback to other DEXes
         const fallbackDexes = Object.values(dexRegistry).filter((dex) => dex !== selectedDex);
         for (const fallbackDex of fallbackDexes) {
           try {
@@ -539,8 +697,13 @@ async function main() {
         const dex = Object.values(dexRegistry)[index];
         let coinOutAmount = BigInt(0);
         if (quote.status === "fulfilled") {
-          coinOutAmount =
-            dex.name === "Aftermath" ? BigInt(quote.value.coinOut.amount || 0) : BigInt(quote.value.coinOutAmount || 0);
+          if (dex.name === "Aftermath") {
+            coinOutAmount = BigInt(quote.value.coinOut.amount || 0);
+          } else if (dex.name === "Turbos") {
+            coinOutAmount = BigInt(quote.value.coinOutAmount || 0);
+          } else if (dex.name === "FlowX") {
+            coinOutAmount = BigInt(quote.value.amountOut || 0);
+          }
         }
         return { dex, quote: coinOutAmount };
       });
