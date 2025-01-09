@@ -136,7 +136,7 @@ export async function executeAftermathSwap(
         const result = await signAndSendTx(client, txb, signer);
     
         console.log(
-            JSON.stringify({ message: "Fund relayed successfully", digest: result.digest })
+            JSON.stringify({ message: "Fund relayed successfully through AFTERMATH :", digest: result.digest })
         );
         return;
     } catch (error) {
@@ -295,7 +295,7 @@ async function executeTurbosSwap(
       const txResult = await signAndSendTx(client, txb, signer);
 
       console.log(
-        JSON.stringify({ message: "Fund relayed successfully", digest: txResult.digest })
+        JSON.stringify({ message: "Fund relayed successfully through TURBOS :", digest: txResult.digest })
       );
 
       return;
@@ -534,7 +534,7 @@ async function executeFlowXSwap(
       const txResult = await signAndSendTx(client, txb, signer);
 
       console.log(
-        JSON.stringify({ message: "Fund relayed successfully", digest: txResult.digest })
+        JSON.stringify({ message: "Fund relayed successfully through FLOW X : ", digest: txResult.digest })
       );
 
       return;
@@ -596,7 +596,7 @@ async function main() {
 
   // DEX Registry
   const dexRegistry: Record<number, { name: string; execute: () => Promise<void>; getQuote: () => Promise<any> }> = {
-    1: {
+    8000: {
       name: "Aftermath",
       execute: async () =>
         executeAftermathSwap(aftermathSdk.Router(),signer,client,_coinInType,_coinOutType,assetForwarderAddress,
@@ -616,7 +616,7 @@ async function main() {
           coinOutType: _coinOutType,
         }),
     },
-    2: {
+    8001: {
       name: "Turbos",
       execute: async () =>
         executeTurbosSwap(signer, client, turbosSdk, _coinInType, _coinOutType, turbosApiUrl, assetForwarderAddress, {
@@ -630,7 +630,7 @@ async function main() {
       getQuote: async () =>
         getTurbosQuote(signer, turbosSdk, _coinInType, _coinOutType, turbosApiUrl, amount),
     },
-    3 : {
+    8002 : {
       name: "FlowX",
       execute: async () =>
         executeFlowXSwap(signer, client, quoter, _coinInType, _coinOutType, assetForwarderAddress, {
@@ -651,35 +651,26 @@ async function main() {
     // Determine DEX execution based on partnerId
     if (partnerId && dexRegistry[partnerIdNumber]) {
       const selectedDex = dexRegistry[partnerIdNumber];
-      console.log(`Executing swap on ${selectedDex.name}...`);
-
       try {
         await selectedDex.execute();
       } catch (primaryError) {
-        const primaryErrorMessage = primaryError instanceof Error ? primaryError.message : `Unknown error: ${String(primaryError)}`;
-        console.error(`Swap failed on ${selectedDex.name}:`, primaryErrorMessage);
-
         //Handle fallback to other DEXes
         const fallbackDexes = Object.values(dexRegistry).filter((dex) => dex !== selectedDex);
+        var fallbackErrorMessage
         for (const fallbackDex of fallbackDexes) {
           try {
-            console.log(`Attempting fallback swap on ${fallbackDex.name}...`);
             await fallbackDex.execute();
             return;
           } catch (fallbackError) {
-            const fallbackErrorMessage = fallbackError instanceof Error ? fallbackError.message : `Unknown error: ${String(fallbackError)}`;
-            console.error(`Fallback failed on ${fallbackDex.name}:`, fallbackErrorMessage);
+            fallbackErrorMessage = fallbackError instanceof Error ? fallbackError.message : `Unknown error: ${String(fallbackError)}`;
           }
         }
-        console.error("All fallback swaps failed.");
+        const primaryErrorMessage = primaryError instanceof Error ? primaryError.message : `Unknown error: ${String(primaryError)}`;
 
-        const formattedError = {
-          error:  "All DEX swaps failed in PartnerID flow ",
-        };    
         console.log(
           JSON.stringify({ 
-              message: "Fund relay failed after maximum retries", 
-              error : formattedError.error
+              message: "All DEX swaps failed in fallback in PartnerId flow ", 
+              error : primaryErrorMessage + "" + fallbackErrorMessage
           })
         );
 
@@ -687,7 +678,6 @@ async function main() {
       }
     } else {
       // Handle case for partnerId === 0 (generalized flow)
-      console.log("Comparing quotes across all DEXes...");
       const quotes = await Promise.allSettled(
         Object.values(dexRegistry).map((dex) => dex.getQuote())
       );
@@ -711,26 +701,23 @@ async function main() {
       // Sort DEXes by quotes
       dexQuotes.sort((a, b) => Number(b.quote - a.quote));
 
+      var errorMessage
       // Attempt swaps in descending order of quotes
       for (const { dex, quote } of dexQuotes) {
         if (quote > 0) {
           try {
-            console.log(`Executing swap on ${dex.name} with quote: ${quote}`);
             await dex.execute();
             return;
           } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : `Unknown error: ${String(error)}`;
-            console.error(`Swap failed on ${dex.name}:`, errorMessage);
+            errorMessage = error instanceof Error ? error.message : `Unknown error: ${String(error)}`;
           }
         }
       }
-      const formattedError = {
-        error:  "All DEX swaps failed in No PartnerId flow ",
-      };    
+   
       console.log(
         JSON.stringify({ 
-            message: "Fund relay failed after maximum retries", 
-            error : formattedError.error
+            message: "All DEX swaps failed in No-PartnerId flow ", 
+            error : errorMessage
         })
       );
       process.exit(1);
@@ -741,7 +728,7 @@ async function main() {
     };    
     console.log(
       JSON.stringify({ 
-          message: "Fund relay failed after maximum retries", 
+          message: "Fund relay failed ", 
           error : formattedError.error
       })
     );
