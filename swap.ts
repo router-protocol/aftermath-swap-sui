@@ -38,7 +38,8 @@ export async function executeAftermathSwap(
   client: SuiClient,
   coinInType: string,
   coinOutType: string,
-  assetForwarderAddress : string,
+  assetForwarderAddress: string,
+  lossThreshold: string,
   {
     amount,
     recipient,
@@ -46,116 +47,194 @@ export async function executeAftermathSwap(
     deposit_id,
     forwarder_router_address,
     minDestAmount,
+    providedFees,
   }: {
     amount: string | number | bigint;
     recipient: string;
-    src_chain_id:string;
-    deposit_id:string;
-    forwarder_router_address:string;
-    minDestAmount:number;
+    src_chain_id: string;
+    deposit_id: string;
+    forwarder_router_address: string;
+    minDestAmount: number;
+    providedFees: string;
   }
 ) {
+  // Convert and validate loss threshold
+  const maxLossThreshold = Number(lossThreshold);
+  if (
+    isNaN(maxLossThreshold) ||
+    maxLossThreshold <= 0 ||
+    maxLossThreshold > 100
+  ) {
+    throw new Error(
+      JSON.stringify({
+        message: "Invalid loss threshold configuration",
+        maxLossThreshold,
+      })
+    );
+  }
 
-  const MAX_RETRIES = 5; // Maximum number of retries
-  let retryCount = 0;
+  // Initialize variables
+  let currentLossThreshold = 10;
+  let currentAmount = BigInt(amount);
+  let finalRoute = null;
 
-  const af_module_address = "0x" + assetForwarderAddress.slice(2, 66);
-  const af_object_id = "0x" + assetForwarderAddress.slice(66);
-
-  while (retryCount <= MAX_RETRIES) {
+  // Find suitable route with required output amount
+  while (currentLossThreshold <= maxLossThreshold) {
     try {
+      const completeRoute = await router.getCompleteTradeRouteGivenAmountIn({
+        coinInAmount: currentAmount,
+        coinInType,
+        coinOutType,
+      });
 
-        const completeRoute = await router.getCompleteTradeRouteGivenAmountIn({
-            coinInAmount: BigInt(amount),
-            coinInType,
-            coinOutType,
-        });
+      const coinOutAmount = Number(completeRoute.coinOut.amount);
 
-        const coinOutAmount = Number(completeRoute.coinOut.amount);
-
-        if (coinOutAmount <= 0) {
-            throw new Error(
-              JSON.stringify({
-                message: "Invalid coinOutAmount received from route",
-                coinOutAmount,
-              })
-            );
-          }
-
-        if (coinOutAmount < minDestAmount) {
-            throw new Error(
-              JSON.stringify({
-                message: "Insufficient coinOutAmount",
-                coinOutAmount,
-                minDestAmount,
-                retryCount,
-              })
-            );
-        }
-
-        const slippage = ((coinOutAmount - minDestAmount) / coinOutAmount) * 100;
-
-        const { tx: txb, coinOutId } = await router.addTransactionForCompleteTradeRoute({
-            tx: new Transaction(),
-            completeRoute,
-            slippage,
-            walletAddress: signer.getPublicKey().toSuiAddress(),
-        });
-
-        if (!af_object_id || !coinOutId) {
-            throw new Error(
-              JSON.stringify({
-                  message: "Fund relay failed due to undefined arguments",
-                  af_object_id,
-                  coinOutId,
-              })
-            );
-        }
-        
-        txb.moveCall({
-            target: `${af_module_address}::asset_forwarder::i_relay`,
-            arguments: [
-            txb.object(af_object_id),
-            txb.object(coinOutId),
-            txb.pure.u64(minDestAmount), 
-            txb.pure(bcs.ser("vector<u8>", ethers.getBytes(src_chain_id)).toBytes()),
-            txb.pure.u256(deposit_id),
-            txb.pure.address(recipient),
-            txb.pure.string(forwarder_router_address),
-            ],
-            typeArguments: [coinOutType],
-        });
-        
-        const suiReward = 0.015 * 10 ** 9;
-
-        const splittedCoin = txb.splitCoins(txb.gas,[suiReward])
-
-        // Transfer the coin to the recipient
-        txb.transferObjects([splittedCoin], txb.pure.address(recipient));
-        
-        const result = await signAndSendTx(client, txb, signer);
-    
-        console.log(
-            JSON.stringify({ message: "Fund relayed successfully through AFTERMATH :", digest: result.digest })
+      if (coinOutAmount <= 0) {
+        throw new Error(
+          JSON.stringify({
+            message: "Invalid coinOutAmount received from route",
+            coinOutAmount,
+          })
         );
-        return;
-    } catch (error) {
-        retryCount++;
-        if (retryCount > MAX_RETRIES) {
-          // Log failure after all retries
-          const formattedError = {
-            error: error instanceof Error ? error.message : "Unknown error occurred",
-          };
-          // Log failure after all retries
-          console.log(
-              JSON.stringify({ 
-                  message: "Fund relay in AFTERMATH failed after maximum retries", 
-                  error : formattedError.error
-              })
-          );
-          throw new Error(formattedError.error);
-        }
       }
+
+      if (coinOutAmount < minDestAmount) {
+        // Calculate adjustment based on provided fees and current threshold
+        const adjustment =
+          (BigInt(providedFees) * BigInt(currentLossThreshold)) / BigInt(100);
+        currentAmount = currentAmount + adjustment;
+
+        console.log(
+          JSON.stringify({
+            message: "Increasing input amount due to insufficient output",
+            currentLossThreshold,
+            originalAmount: amount,
+            newAmount: currentAmount.toString(),
+            adjustment: adjustment.toString(),
+            coinOutAmount,
+            minDestAmount,
+          })
+        );
+
+        currentLossThreshold += 10;
+        if (currentLossThreshold > maxLossThreshold) {
+          throw new Error(
+            JSON.stringify({
+              message: "Maximum loss threshold reached in AFTERMATH",
+              maxLossThreshold,
+              finalCoinOutAmount: coinOutAmount,
+              minDestAmount,
+              finalAmount: currentAmount.toString(),
+            })
+          );
+        }
+        continue;
+      }
+
+      finalRoute = completeRoute;
+      break;
+    } catch (error) {
+      if (
+        currentLossThreshold > maxLossThreshold ||
+        !(
+          error instanceof Error &&
+          error.message.includes("Insufficient coinOutAmount")
+        )
+      ) {
+        console.error(
+          JSON.stringify({
+            message: "Failed to find suitable route in AFTERMATH",
+            error:
+              error instanceof Error ? error.message : "Unknown error occurred",
+            finalLossThreshold: currentLossThreshold - 10,
+          })
+        );
+        throw error;
+      }
+    }
+  }
+  // If no suitable route found
+  if (!finalRoute) {
+    throw new Error(
+      JSON.stringify({
+        message: "Could not find suitable route in AFTERMATH after all retries",
+        finalAmount: currentAmount.toString(),
+        finalLossThreshold: currentLossThreshold - 10,
+      })
+    );
+  }
+
+  try {
+    const af_module_address = "0x" + assetForwarderAddress.slice(2, 66);
+    const af_object_id = "0x" + assetForwarderAddress.slice(66);
+
+    const slippage =
+      ((Number(finalRoute.coinOut.amount) - minDestAmount) /
+        Number(finalRoute.coinOut.amount)) *
+      100;
+
+    const { tx: txb, coinOutId } =
+      await router.addTransactionForCompleteTradeRoute({
+        tx: new Transaction(),
+        completeRoute: finalRoute,
+        slippage,
+        walletAddress: signer.getPublicKey().toSuiAddress(),
+      });
+
+    if (!af_object_id || !coinOutId) {
+      throw new Error(
+        JSON.stringify({
+          message: "Fund relay failed in AFTERMATH due to undefined arguments",
+          af_object_id,
+          coinOutId,
+        })
+      );
+    }
+
+    txb.moveCall({
+      target: `${af_module_address}::asset_forwarder::i_relay`,
+      arguments: [
+        txb.object(af_object_id),
+        txb.object(coinOutId),
+        txb.pure.u64(minDestAmount),
+        txb.pure(
+          bcs.ser("vector<u8>", ethers.getBytes(src_chain_id)).toBytes()
+        ),
+        txb.pure.u256(deposit_id),
+        txb.pure.address(recipient),
+        txb.pure.string(forwarder_router_address),
+      ],
+      typeArguments: [coinOutType],
+    });
+
+    const suiReward = 0.015 * 10 ** 9;
+    const splittedCoin = txb.splitCoins(txb.gas, [suiReward]);
+    txb.transferObjects([splittedCoin], txb.pure.address(recipient));
+
+    const result = await signAndSendTx(client, txb, signer);
+
+    console.log(
+      JSON.stringify({
+        message: "Fund relayed successfully through AFTERMATH",
+        digest: result.digest,
+        finalLossThreshold: currentLossThreshold - 10,
+        finalAmount: currentAmount.toString(),
+      })
+    );
+    return;
+  } catch (error) {
+    const formattedError = {
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    };
+    console.error(
+      JSON.stringify({
+        message: "Transaction execution failed in AFTERMATH",
+        error: formattedError.error,
+        finalLossThreshold: currentLossThreshold - 10,
+        finalAmount: currentAmount.toString(),
+      })
+    );
+    throw new Error(formattedError.error);
   }
 }
 
@@ -170,7 +249,8 @@ async function executeTurbosSwap(
   coinInType: string,
   coinOutType: string,
   apiUrl: string,
-  assetForwarderAddress : string,
+  assetForwarderAddress: string,
+  lossThreshold: string,
   {
     amount,
     recipient,
@@ -178,146 +258,213 @@ async function executeTurbosSwap(
     deposit_id,
     forwarder_router_address,
     minDestAmount,
+    providedFees
   }: {
     amount: string | number | bigint;
     recipient: string;
-    src_chain_id:string;
-    deposit_id:string;
-    forwarder_router_address:string;
-    minDestAmount:number;
+    src_chain_id: string;
+    deposit_id: string;
+    forwarder_router_address: string;
+    minDestAmount: number;
+    providedFees: string;
   }
 ) {
+    // Convert and validate loss threshold
+    const maxLossThreshold = Number(lossThreshold);
+    if (isNaN(maxLossThreshold) || maxLossThreshold <= 0 || maxLossThreshold > 100) {
+        throw new Error(JSON.stringify({
+            message: "Invalid loss threshold configuration",
+            maxLossThreshold
+        }));
+    }
 
-  const MAX_RETRIES = 5; // Maximum number of retries
-  let retryCount = 0;
+    // Initialize variables
+    let currentLossThreshold = 10;
+    let currentAmount = BigInt(amount);
+    let finalQuote = null;
 
-  const af_module_address = "0x" + assetForwarderAddress.slice(2, 66);
-  const af_object_id = "0x" + assetForwarderAddress.slice(66);
+    // Find suitable quote with required output amount
+    while (currentLossThreshold <= maxLossThreshold) {
+        try {
+            const quoteResult = await getTurbosQuote(
+                signer,
+                sdk,
+                coinInType,
+                coinOutType,
+                apiUrl,
+                currentAmount.toString()
+            );
 
-  while (retryCount <= MAX_RETRIES) {
+            const { coinOutAmount, bestPoolId, result, a2b } = quoteResult;
+
+            if (coinOutAmount <= 0) {
+                throw new Error(
+                    JSON.stringify({
+                        message: "Invalid coinOutAmount received from route",
+                        coinOutAmount,
+                    })
+                );
+            }
+
+            if (coinOutAmount < minDestAmount) {
+                // Calculate adjustment based on provided fees and current threshold
+                const adjustment = (BigInt(providedFees) * BigInt(currentLossThreshold)) / BigInt(100);
+                currentAmount = currentAmount + adjustment;
+
+                console.log(
+                    JSON.stringify({
+                        message: "Increasing input amount due to insufficient output in TURBOS",
+                        currentLossThreshold,
+                        originalAmount: amount,
+                        newAmount: currentAmount.toString(),
+                        adjustment: adjustment.toString(),
+                        coinOutAmount,
+                        minDestAmount
+                    })
+                );
+
+                currentLossThreshold += 10;
+                if (currentLossThreshold > maxLossThreshold) {
+                    throw new Error(
+                        JSON.stringify({
+                            message: "Maximum loss threshold reached in TURBOS",
+                            maxLossThreshold,
+                            finalCoinOutAmount: coinOutAmount,
+                            minDestAmount,
+                            finalAmount: currentAmount.toString()
+                        })
+                    );
+                }
+                continue;
+            }
+
+            finalQuote = quoteResult;
+            break;
+
+        } catch (error) {
+            if (currentLossThreshold > maxLossThreshold || 
+                !(error instanceof Error && error.message.includes("Insufficient coinOutAmount"))) {
+                console.error(
+                    JSON.stringify({ 
+                        message: "Failed to find suitable quote in TURBOS",
+                        error: error instanceof Error ? error.message : "Unknown error occurred",
+                        finalLossThreshold: currentLossThreshold - 10
+                    })
+                );
+                throw error;
+            }
+        }
+    }
+
+    // If no suitable quote found
+    if (!finalQuote) {
+        throw new Error(
+            JSON.stringify({
+                message: "Could not find suitable quote in TURBOS after all retries",
+                finalAmount: currentAmount.toString(),
+                finalLossThreshold: currentLossThreshold - 10
+            })
+        );
+    }
+
     try {
+        const af_module_address = "0x" + assetForwarderAddress.slice(2, 66);
+        const af_object_id = "0x" + assetForwarderAddress.slice(66);
 
-      const {coinOutAmount,bestPoolId,result,a2b} = await getTurbosQuote(signer,sdk,coinInType,coinOutType,apiUrl,amount);
+        const { coinOutAmount, bestPoolId, result, a2b } = finalQuote;
+        const nextTickIndex = sdk.math.bitsToNumber(result.tick_current_index.bits);
+        const slippage = ((coinOutAmount - minDestAmount) / coinOutAmount) * 100;
 
-      // Check for invalid coinOutAmount
-      if (coinOutAmount <= 0) {
-        throw new Error(
-          JSON.stringify({
-            message: "Invalid coinOutAmount received from route",
-            coinOutAmount,
-          })
-        );
-      }
+        const swapOptions: Trade.SwapWithReturnOptions = {
+            poolId: bestPoolId,
+            coinType: coinInType,
+            amountA: a2b ? currentAmount.toString() : String(coinOutAmount),
+            amountB: a2b ? String(coinOutAmount) : currentAmount.toString(),
+            swapAmount: currentAmount.toString(),
+            nextTickIndex,
+            slippage: String(slippage),
+            amountSpecifiedIsInput: true,
+            a2b: a2b,
+            address: signer.getPublicKey().toSuiAddress(),
+        };
 
-      // Check if coinOutAmount meets minDestAmount
-      if (coinOutAmount < minDestAmount) {
-        throw new Error(
-          JSON.stringify({
-            message: "Insufficient coinOutAmount",
-            coinOutAmount,
-            minDestAmount,
-          })
-        );
-      }
+        const { txb, coinVecA, coinVecB } = await sdk.trade.swapWithReturn(swapOptions);
 
-      const nextTickIndex = sdk.math.bitsToNumber(result.tick_current_index.bits);
-
-      const slippage = ((coinOutAmount - minDestAmount) / coinOutAmount) * 100;
-
-      const swapOptions: Trade.SwapWithReturnOptions = {
-        poolId: bestPoolId,
-        coinType: coinInType,
-        amountA: a2b ? String(amount) : String(coinOutAmount), // Input token amount
-        amountB: a2b ? String(coinOutAmount) : String(amount), // Output token amount
-        swapAmount: String(amount), // Always the input amount
-        nextTickIndex,
-        slippage: String(slippage),
-        amountSpecifiedIsInput: true,
-        a2b: a2b,
-        address: signer.getPublicKey().toSuiAddress(),
-      };
-
-      const { txb, coinVecA, coinVecB } = await sdk.trade.swapWithReturn(swapOptions);
-
-      // Use the coinOutId from the appropriate vector (coinVecA or coinVecB)
-      let coinOutId 
-      if(a2b){
-        coinOutId = coinVecB
-        if(coinVecA){
-          txb.transferObjects([coinVecA],txb.pure.address(recipient))
+        let coinOutId;
+        if (a2b) {
+            coinOutId = coinVecB;
+            if (coinVecA) {
+                txb.transferObjects([coinVecA], txb.pure.address(recipient));
+            }
+        } else {
+            coinOutId = coinVecA;
+            if (coinVecB) {
+                txb.transferObjects([coinVecB], txb.pure.address(recipient));
+            }
         }
-      } else {
-        coinOutId = coinVecA
-        if(coinVecB){
-          txb.transferObjects([coinVecB],txb.pure.address(recipient))
+
+        if (!coinOutId) {
+            throw new Error(
+                JSON.stringify({
+                    message: "Failed to retrieve coinOutId from TURBOS"
+                })
+            );
         }
-      }
 
-      if (!coinOutId) {
-        throw new Error(
-          JSON.stringify({
-              message: "Failed to retrieve coinOutId from TURBOS",
-          })
+        if (!af_object_id || !coinOutId) {
+            throw new Error(
+                JSON.stringify({
+                    message: "Fund relay failed due to undefined arguments",
+                    af_object_id,
+                    coinOutId,
+                })
+            );
+        }
+
+        txb.moveCall({
+            target: `${af_module_address}::asset_forwarder::i_relay`,
+            arguments: [
+                txb.object(af_object_id),
+                txb.object(coinOutId),
+                txb.pure.u64(minDestAmount),
+                txb.pure(bcs.ser("vector<u8>", ethers.getBytes(src_chain_id)).toBytes()),
+                txb.pure.u256(deposit_id),
+                txb.pure.address(recipient),
+                txb.pure.string(forwarder_router_address),
+            ],
+            typeArguments: [coinOutType],
+        });
+
+        const suiReward = 0.015 * 10 ** 9;
+        const splittedCoin = txb.splitCoins(txb.gas, [suiReward]);
+        txb.transferObjects([splittedCoin], txb.pure.address(recipient));
+
+        const txResult = await signAndSendTx(client, txb, signer);
+
+        console.log(
+            JSON.stringify({
+                message: "Fund relayed successfully through TURBOS",
+                digest: txResult.digest,
+                finalLossThreshold: currentLossThreshold - 10,
+                finalAmount: currentAmount.toString()
+            })
         );
-      }
-
-      if (!af_object_id || !coinOutId) {
-        throw new Error(
-          JSON.stringify({
-              message: "Fund relay failed due to undefined arguments",
-              af_object_id,
-              coinOutId,
-          })
-        );
-      }
-
-      txb.moveCall({
-        target: `${af_module_address}::asset_forwarder::i_relay`,
-        arguments: [
-        txb.object(af_object_id),
-        txb.object(coinOutId),
-        txb.pure.u64(minDestAmount), 
-        txb.pure(bcs.ser("vector<u8>", ethers.getBytes(src_chain_id)).toBytes()),
-        txb.pure.u256(deposit_id),
-        txb.pure.address(recipient),
-        txb.pure.string(forwarder_router_address),
-        ],
-        typeArguments: [coinOutType],
-      });
-
-      const suiReward = 0.015 * 10 ** 9;
-
-      const splittedCoin = txb.splitCoins(txb.gas,[suiReward])
-
-      // Transfer the coin to the recipient
-      txb.transferObjects([splittedCoin], txb.pure.address(recipient));
-
-      const txResult = await signAndSendTx(client, txb, signer);
-
-      console.log(
-        JSON.stringify({ message: "Fund relayed successfully through TURBOS :", digest: txResult.digest })
-      );
-
-      return;
+        return;
 
     } catch (error) {
-      retryCount++;
-      if (retryCount > MAX_RETRIES) {
-          // Log failure after all retries
-          const formattedError = {
+        const formattedError = {
             error: error instanceof Error ? error.message : "Unknown error occurred",
-          };
-          // Log failure after all retries
-          console.log(
-              JSON.stringify({ 
-                  message: "Fund relay in TURBOS failed after maximum retries", 
-                  error : formattedError.error
-              })
-          );
-          throw new Error(formattedError.error);
-      }
+        };
+        console.error(
+            JSON.stringify({
+                message: "Transaction execution failed in TURBOS",
+                error: formattedError.error,
+                finalLossThreshold: currentLossThreshold - 10,
+                finalAmount: currentAmount.toString()
+            })
+        );
+        throw new Error(formattedError.error);
     }
-  }
 }
 
 async function getTurbosQuote(
@@ -430,7 +577,8 @@ async function executeFlowXSwap(
   quoter: AggregatorQuoter,
   coinInType: string,
   coinOutType: string,
-  assetForwarderAddress : string,
+  assetForwarderAddress: string,
+  lossThreshold: string,
   {
     amount,
     recipient,
@@ -438,125 +586,185 @@ async function executeFlowXSwap(
     deposit_id,
     forwarder_router_address,
     minDestAmount,
+    providedFees,
   }: {
     amount: string | number | bigint;
     recipient: string;
-    src_chain_id:string;
-    deposit_id:string;
-    forwarder_router_address:string;
-    minDestAmount:number;
+    src_chain_id: string;
+    deposit_id: string;
+    forwarder_router_address: string;
+    minDestAmount: number;
+    providedFees: string;
   }
 ) {
-
-  const MAX_RETRIES = 5; // Maximum number of retries
-  let retryCount = 0;
-
-  const af_module_address = "0x" + assetForwarderAddress.slice(2, 66);
-  const af_object_id = "0x" + assetForwarderAddress.slice(66);
-
-  while (retryCount <= MAX_RETRIES) {
-    try {
-      const routes = await quoter.getRoutes({
-        tokenIn: coinInType,
-        tokenOut: coinOutType,
-        amountIn: amount as string,
-      })
-
-      const coinOutAmount = Number(routes.amountOut);
-
-      if (coinOutAmount <= 0) {
-        throw new Error(
-          JSON.stringify({
-            message: "Invalid coinOutAmount received from route",
-            coinOutAmount,
-          })
-        );
-      }
-
-      if (coinOutAmount < minDestAmount) {
-          throw new Error(
-            JSON.stringify({
-              message: "Insufficient coinOutAmount",
-              coinOutAmount,
-              minDestAmount,
-              retryCount,
-            })
-          );
-      }
-
-      const slippage = (((coinOutAmount - minDestAmount) / coinOutAmount) * 100) * 10000;
-
-      const tradeBuilder = new TradeBuilder("mainnet", routes.routes); 
-
-      const trade = tradeBuilder
-                      .sender(signer.getPublicKey().toSuiAddress())
-                      .amountIn(amount as string)
-                      .amountOut(routes.amountOut)
-                      .slippage(Number(slippage.toFixed(0))) //  1% = 10000
-                      .deadline(Date.now() +3600000) // 1 hour from now
-                      .build();
-      
-      const txb = new Transaction()
-
-      const coinOutId = await trade.swap({ tx: txb, client: client });
-
-      if (!af_object_id || !coinOutId) {
-        throw new Error(
-          JSON.stringify({
-              message: "Fund relay failed due to undefined arguments",
-              af_object_id,
-              coinOutId,
-          })
-        );
-      }
-
-      txb.moveCall({
-        target: `${af_module_address}::asset_forwarder::i_relay`,
-        arguments: [
-        txb.object(af_object_id),
-        txb.object(coinOutId),
-        txb.pure.u64(minDestAmount), 
-        txb.pure(bcs.ser("vector<u8>", ethers.getBytes(src_chain_id)).toBytes()),
-        txb.pure.u256(deposit_id),
-        txb.pure.address(recipient),
-        txb.pure.string(forwarder_router_address),
-        ],
-        typeArguments: [coinOutType],
-      });
-
-      const suiReward = 0.015 * 10 ** 9;
-
-      const splittedCoin = txb.splitCoins(txb.gas,[suiReward])
-
-      // Transfer the coin to the recipient
-      txb.transferObjects([splittedCoin], txb.pure.address(recipient));
-
-      const txResult = await signAndSendTx(client, txb, signer);
-
-      console.log(
-        JSON.stringify({ message: "Fund relayed successfully through FLOW X : ", digest: txResult.digest })
-      );
-
-      return;
-
-      } catch (error) {
-        retryCount++;
-        if (retryCount > MAX_RETRIES) {
-          // Log failure after all retries
-          const formattedError = {
-            error: error instanceof Error ? error.message : "Unknown error occurred",
-          };
-          // Log failure after all retries
-          console.log(
-              JSON.stringify({ 
-                  message: "Fund relay in FlowX failed after maximum retries", 
-                  error : formattedError.error
-              })
-          );
-          throw new Error(formattedError.error);
-      }
+    // Convert and validate loss threshold
+    const maxLossThreshold = Number(lossThreshold);
+    if (isNaN(maxLossThreshold) || maxLossThreshold <= 0 || maxLossThreshold > 100) {
+        throw new Error(JSON.stringify({
+            message: "Invalid loss threshold configuration",
+            maxLossThreshold
+        }));
     }
-  }
+
+    // Initialize variables
+    let currentLossThreshold = 10;
+    let currentAmount = BigInt(amount);
+    let finalRoute = null;
+
+    // Find suitable quote with required output amount
+    while (currentLossThreshold <= maxLossThreshold) {
+        try {
+            const routes = await quoter.getRoutes({
+                tokenIn: coinInType,
+                tokenOut: coinOutType,
+                amountIn: currentAmount.toString(),
+            });
+
+            const coinOutAmount = Number(routes.amountOut);
+
+            if (coinOutAmount <= 0) {
+                throw new Error(
+                    JSON.stringify({
+                        message: "Invalid coinOutAmount received from route",
+                        coinOutAmount,
+                    })
+                );
+            }
+
+            if (coinOutAmount < minDestAmount) {
+                // Calculate adjustment based on provided fees and current threshold
+                const adjustment = (BigInt(providedFees) * BigInt(currentLossThreshold)) / BigInt(100);
+                currentAmount = currentAmount + adjustment;
+
+                console.log(
+                    JSON.stringify({
+                        message: "Increasing input amount due to insufficient output in FlowX",
+                        currentLossThreshold,
+                        originalAmount: amount,
+                        newAmount: currentAmount.toString(),
+                        adjustment: adjustment.toString(),
+                        coinOutAmount,
+                        minDestAmount
+                    })
+                );
+
+                currentLossThreshold += 10;
+                if (currentLossThreshold > maxLossThreshold) {
+                    throw new Error(
+                        JSON.stringify({
+                            message: "Maximum loss threshold reached in FlowX",
+                            maxLossThreshold,
+                            finalCoinOutAmount: coinOutAmount,
+                            minDestAmount,
+                            finalAmount: currentAmount.toString()
+                        })
+                    );
+                }
+                continue;
+            }
+
+            finalRoute = routes;
+            break;
+
+        } catch (error) {
+            if (currentLossThreshold > maxLossThreshold || 
+                !(error instanceof Error && error.message.includes("Insufficient coinOutAmount"))) {
+                console.error(
+                    JSON.stringify({ 
+                        message: "Failed to find suitable quote in FlowX",
+                        error: error instanceof Error ? error.message : "Unknown error occurred",
+                        finalLossThreshold: currentLossThreshold - 10
+                    })
+                );
+                throw error;
+            }
+        }
+    }
+
+    // If no suitable route found
+    if (!finalRoute) {
+        throw new Error(
+            JSON.stringify({
+                message: "Could not find suitable quote in FlowX after all retries",
+                finalAmount: currentAmount.toString(),
+                finalLossThreshold: currentLossThreshold - 10
+            })
+        );
+    }
+
+    try {
+        const af_module_address = "0x" + assetForwarderAddress.slice(2, 66);
+        const af_object_id = "0x" + assetForwarderAddress.slice(66);
+
+        const coinOutAmount = Number(finalRoute.amountOut);
+        const slippage = (((coinOutAmount - minDestAmount) / coinOutAmount) * 100) * 10000;
+
+        const tradeBuilder = new TradeBuilder("mainnet", finalRoute.routes);
+        const trade = tradeBuilder
+            .sender(signer.getPublicKey().toSuiAddress())
+            .amountIn(currentAmount.toString())
+            .amountOut(finalRoute.amountOut)
+            .slippage(Number(slippage.toFixed(0)))
+            .deadline(Date.now() + 3600000)
+            .build();
+
+        const txb = new Transaction();
+        const coinOutId = await trade.swap({ tx: txb, client: client });
+
+        if (!af_object_id || !coinOutId) {
+            throw new Error(
+                JSON.stringify({
+                    message: "Fund relay failed due to undefined arguments",
+                    af_object_id,
+                    coinOutId,
+                })
+            );
+        }
+
+        txb.moveCall({
+            target: `${af_module_address}::asset_forwarder::i_relay`,
+            arguments: [
+                txb.object(af_object_id),
+                txb.object(coinOutId),
+                txb.pure.u64(minDestAmount),
+                txb.pure(bcs.ser("vector<u8>", ethers.getBytes(src_chain_id)).toBytes()),
+                txb.pure.u256(deposit_id),
+                txb.pure.address(recipient),
+                txb.pure.string(forwarder_router_address),
+            ],
+            typeArguments: [coinOutType],
+        });
+
+        const suiReward = 0.015 * 10 ** 9;
+        const splittedCoin = txb.splitCoins(txb.gas, [suiReward]);
+        txb.transferObjects([splittedCoin], txb.pure.address(recipient));
+
+        const txResult = await signAndSendTx(client, txb, signer);
+
+        console.log(
+            JSON.stringify({
+                message: "Fund relayed successfully through FlowX",
+                digest: txResult.digest,
+                finalLossThreshold: currentLossThreshold - 10,
+                finalAmount: currentAmount.toString()
+            })
+        );
+        return;
+
+    } catch (error) {
+        const formattedError = {
+            error: error instanceof Error ? error.message : "Unknown error occurred",
+        };
+        console.error(
+            JSON.stringify({
+                message: "Transaction execution failed in FlowX",
+                error: formattedError.error,
+                finalLossThreshold: currentLossThreshold - 10,
+                finalAmount: currentAmount.toString()
+            })
+        );
+        throw new Error(formattedError.error);
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -575,6 +783,8 @@ async function main() {
     forwarderRouterAddress,
     minDestAmount,
     assetForwarderAddress,
+    lossThreshold,
+    providedFees
   ] = process.argv.slice(2);
 
   const formatHex = (value: string): string => (value.startsWith("0x") ? value : `0x${value}`);
@@ -595,11 +805,21 @@ async function main() {
   const quoter = new AggregatorQuoter('mainnet');
 
   // DEX Registry
-  const dexRegistry: Record<number, { name: string; execute: () => Promise<void>; getQuote: () => Promise<any> }> = {
+  const dexRegistry: Record<
+    number,
+    { name: string; execute: () => Promise<void>; getQuote: () => Promise<any> }
+  > = {
     8000: {
       name: "Aftermath",
       execute: async () =>
-        executeAftermathSwap(aftermathSdk.Router(),signer,client,_coinInType,_coinOutType,assetForwarderAddress,
+        executeAftermathSwap(
+          aftermathSdk.Router(),
+          signer,
+          client,
+          _coinInType,
+          _coinOutType,
+          assetForwarderAddress,
+          lossThreshold,
           {
             amount,
             recipient: _recipient,
@@ -607,6 +827,7 @@ async function main() {
             deposit_id: depositId,
             forwarder_router_address: forwarderRouterAddress,
             minDestAmount: Number(minDestAmount),
+            providedFees,
           }
         ),
       getQuote: async () =>
@@ -619,31 +840,63 @@ async function main() {
     8001: {
       name: "Turbos",
       execute: async () =>
-        executeTurbosSwap(signer, client, turbosSdk, _coinInType, _coinOutType, turbosApiUrl, assetForwarderAddress, {
-          amount,
-          recipient: _recipient,
-          src_chain_id: _srcChainId,
-          deposit_id: depositId,
-          forwarder_router_address: forwarderRouterAddress,
-          minDestAmount: Number(minDestAmount),
-        }),
+        executeTurbosSwap(
+          signer,
+          client,
+          turbosSdk,
+          _coinInType,
+          _coinOutType,
+          turbosApiUrl,
+          assetForwarderAddress,
+          lossThreshold,
+          {
+            amount,
+            recipient: _recipient,
+            src_chain_id: _srcChainId,
+            deposit_id: depositId,
+            forwarder_router_address: forwarderRouterAddress,
+            minDestAmount: Number(minDestAmount),
+            providedFees,
+          }
+        ),
       getQuote: async () =>
-        getTurbosQuote(signer, turbosSdk, _coinInType, _coinOutType, turbosApiUrl, amount),
+        getTurbosQuote(
+          signer,
+          turbosSdk,
+          _coinInType,
+          _coinOutType,
+          turbosApiUrl,
+          amount
+        ),
     },
-    8002 : {
+    8002: {
       name: "FlowX",
       execute: async () =>
-        executeFlowXSwap(signer, client, quoter, _coinInType, _coinOutType, assetForwarderAddress, {
-          amount,
-          recipient: _recipient,
-          src_chain_id: _srcChainId,
-          deposit_id: depositId,
-          forwarder_router_address: forwarderRouterAddress,
-          minDestAmount: Number(minDestAmount),
+        executeFlowXSwap(
+          signer,
+          client,
+          quoter,
+          _coinInType,
+          _coinOutType,
+          assetForwarderAddress,
+          lossThreshold,
+          {
+            amount,
+            recipient: _recipient,
+            src_chain_id: _srcChainId,
+            deposit_id: depositId,
+            forwarder_router_address: forwarderRouterAddress,
+            minDestAmount: Number(minDestAmount),
+            providedFees,
+          }
+        ),
+      getQuote: async () =>
+        quoter.getRoutes({
+          tokenIn: coinInType,
+          tokenOut: coinOutType,
+          amountIn: amount as string,
         }),
-      getQuote: async () => 
-        quoter.getRoutes({tokenIn: coinInType,tokenOut: coinOutType,amountIn: amount as string}),    
-    }
+    },
   };
 
   try {
