@@ -596,7 +596,7 @@ async function main() {
 
   // DEX Registry
   const dexRegistry: Record<number, { name: string; execute: () => Promise<void>; getQuote: () => Promise<any> }> = {
-    8000: {
+    8001: {
       name: "Aftermath",
       execute: async () =>
         executeAftermathSwap(aftermathSdk.Router(),signer,client,_coinInType,_coinOutType,assetForwarderAddress,
@@ -616,7 +616,7 @@ async function main() {
           coinOutType: _coinOutType,
         }),
     },
-    8001: {
+    8000: {
       name: "Turbos",
       execute: async () =>
         executeTurbosSwap(signer, client, turbosSdk, _coinInType, _coinOutType, turbosApiUrl, assetForwarderAddress, {
