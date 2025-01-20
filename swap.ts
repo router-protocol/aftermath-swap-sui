@@ -805,10 +805,7 @@ async function main() {
   const quoter = new AggregatorQuoter('mainnet');
 
   // DEX Registry
-  const dexRegistry: Record<
-    number,
-    { name: string; execute: () => Promise<void>; getQuote: () => Promise<any> }
-  > = {
+  const dexRegistry: Record<number, { name: string; execute: () => Promise<void>; getQuote: () => Promise<any> }> = {
     8000: {
       name: "Aftermath",
       execute: async () =>
