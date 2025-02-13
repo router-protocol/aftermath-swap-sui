@@ -78,10 +78,8 @@ async function ledgerInfo( client: Aptos)
   while (retryCount <= MAX_RETRIES) {
     try {
       const ledgerInfo = await client.getLedgerInfo();
-      const block = await client.getBlockByHeight({ blockHeight: Number(ledgerInfo.block_height) });
-      console.log("Ledger Info:", ledgerInfo);
       console.log(
-        JSON.stringify({ blockHeight: ledgerInfo.block_height})
+        JSON.stringify({ blockHeight: ledgerInfo.ledger_version})
     );
     return;
   } catch (error) {
@@ -115,7 +113,7 @@ let retryCount = 0;
 while (retryCount <= MAX_RETRIES) {
   try {
     const options = {
-      limit: 1,
+      limit: 100,
       offset: 0, // Start from the latest events
       orderBy: [{ transaction_version: "desc" as OrderByValue }], // Fetch from latest
     };
