@@ -115,10 +115,8 @@ async function ledgerInfo( client: Aptos)
   while (retryCount <= MAX_RETRIES) {
     try {
       const ledgerInfo = await client.getLedgerInfo();
-      const block = await client.getBlockByHeight({ blockHeight: Number(ledgerInfo.block_height) });
-      console.log("Ledger Info:", ledgerInfo);
       console.log(
-        JSON.stringify({ blockHeight: ledgerInfo.block_height})
+        JSON.stringify({ blockHeight: ledgerInfo.ledger_version})
     );
     return;
   } catch (error) {
@@ -147,7 +145,7 @@ async function main() {
       contractAddress,
     ] = process.argv.slice(2);
     
-  const config = new AptosConfig({ network: Network.MAINNET });
+  const config = new AptosConfig({ network: Network.TESTNET });
   const client = new Aptos(config);
 
 
@@ -159,11 +157,11 @@ async function main() {
       case "2":
         contractAddress.startsWith("0x") ? contractAddress : `0x${contractAddress}`
         const gatewayEventTypes = [
-            `0x${contractAddress}::gateway_contract::ISendEvent`,
-            `0x${contractAddress}::gateway_contract::IReceiveEvent`,
-            `0x${contractAddress}::gateway_contract::IAckEvent`,
-            `0x${contractAddress}::gateway_contract::SetDappMetadataEvent`,
-            `0x${contractAddress}::gateway_contract::ValsetUpdatedEvent`
+            `${contractAddress}::events::ISendEvent`,
+            `${contractAddress}::events::IReceiveEvent`,
+            `${contractAddress}::events::IAckEvent`,
+            `${contractAddress}::events::SetDappMetadataEvent`,
+            `${contractAddress}::events::ValsetUpdateEvent`
           ];
         await fetchContractEvents(
           client,
@@ -174,11 +172,11 @@ async function main() {
         case "3":
         contractAddress.startsWith("0x") ? contractAddress : `0x${contractAddress}`
         const voyagerEventTypes = [
-            `0x${contractAddress}::gateway_contract::FundsDeposited`,
-            `0x${contractAddress}::gateway_contract::FundsDepositedWithMessage`,
-            `0x${contractAddress}::gateway_contract::FundsPaid`,
-            `0x${contractAddress}::gateway_contract::FundsPaidWithMessage`,
-            `0x${contractAddress}::gateway_contract::DepositInfoUpdate`
+            `${contractAddress}::events::FundsDeposited`,
+            `${contractAddress}::events::FundsDepositedWithMessage`,
+            `${contractAddress}::events::FundsPaid`,
+            `${contractAddress}::events::FundsPaidWithMessage`,
+            `${contractAddress}::events::DepositInfoUpdate`
           ];
         await fetchContractEvents(
           client,
